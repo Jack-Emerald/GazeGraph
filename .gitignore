@@ -1,4 +1,5 @@
 logs/
 models/
+all_gazes_text/
 __pycache__/
 .idea/
