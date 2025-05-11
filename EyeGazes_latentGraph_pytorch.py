@@ -31,10 +31,70 @@ def set_seed(seed=42):
     torch.backends.cudnn.benchmark = False
 
 
+class LatentGestureModel(PyroModule):
+    def __init__(self, input_len, input_dim, num_latents, num_classes):
+        super().__init__()
+        self.num_latents = num_latents
+        self.num_classes = num_classes
+
+        # CNN Layers (same as GestureCNN)
+        self.conv1 = nn.Conv1d(input_dim, 256, kernel_size=7, padding=3)
+        self.conv2 = nn.Conv1d(256, 256, kernel_size=7, padding=3)
+        self.pool1 = nn.MaxPool1d(2)
+        self.conv3 = nn.Conv1d(256, 256, kernel_size=7, padding=3)
+        self.pool2 = nn.MaxPool1d(2)
+        self.conv4 = nn.Conv1d(256, 256, kernel_size=3, padding=1)
+        self.pool3 = nn.MaxPool1d(2)
+        self._to_linear = self._get_flatten_size(input_len, input_dim)
+        self.fc1 = nn.Linear(self._to_linear, 100)
+        self.dropout = nn.Dropout(0.5)
+
+        # Latent Variables: This part will combine with the CNN features
+        self.classifier = PyroModule[nn.Linear](100 + num_latents, num_classes)
+
+    def _get_flatten_size(self, input_len, input_dim):
+        x = torch.zeros(1, input_dim, input_len)
+        x = self.pool1(F.relu(self.conv2(F.relu(self.conv1(x)))))
+        x = self.pool2(F.relu(self.conv3(x)))
+        x = self.pool3(F.relu(self.conv4(x)))
+        return x.view(1, -1).size(1)
+
+    def forward(self, x, y=None):
+        batch_size = x.size(0)
+        device = x.device
+
+        # CNN Forward Pass (same as GestureCNN)
+        x = self.pool1(F.relu(self.conv2(F.relu(self.conv1(x)))))
+        x = self.pool2(F.relu(self.conv3(x)))
+        x = self.pool3(F.relu(self.conv4(x)))
+        x = x.view(x.size(0), -1)  # Flattening
+        x = F.relu(self.fc1(x))  # Fully connected layer
+        x = self.dropout(x)  # Dropout layer
+
+
+        # Latent Variable Inference: z is the latent variable
+        z_probs = torch.ones(batch_size, self.num_latents) / self.num_latents  # Uniform prior for latent variable
+        z = pyro.sample("z", dist.Categorical(z_probs))  # Latent variable sampled
+
+        # One-hot encoding for z
+        z_one_hot = F.one_hot(z, num_classes=self.num_latents).float().to(device)
+
+        # Combine CNN output and latent variable
+        combined_features = torch.cat([x, z_one_hot], dim=1)
+
+        # Classifier
+        logits = self.classifier(combined_features)
+
+        with pyro.plate("data", batch_size):
+            pyro.sample("obs", dist.Categorical(logits=logits), obs=y)
+
+        return logits
+
+
 # --- Model ---
-class GestureCNN(nn.Module):
+class Gesturebasic(nn.Module):
     def __init__(self, input_len, input_dim, num_classes):
-        super(GestureCNN, self).__init__()
+        super(Gesturebasic, self).__init__()
         self.conv1 = nn.Conv1d(input_dim, 256, kernel_size=7, padding=3)
         self.conv2 = nn.Conv1d(256, 256, kernel_size=7, padding=3)
         self.pool1 = nn.MaxPool1d(2)
@@ -63,26 +123,6 @@ class GestureCNN(nn.Module):
         x = self.dropout(x)
         return self.out(x)
 
-
-class LatentGestureModel(PyroModule):
-    def __init__(self, num_latents, num_classes):
-        super().__init__()
-        self.num_latents = num_latents
-        self.num_classes = num_classes
-        self.classifier = PyroModule[nn.Linear](num_latents, num_classes)
-
-    def forward(self, x, y=None):
-        batch_size = x.size(0)
-        z_probs = torch.ones(batch_size, self.num_latents) / self.num_latents
-        z = pyro.sample("z", dist.Categorical(z_probs))
-
-        z_one_hot = F.one_hot(z, num_classes=self.num_latents).float()
-        logits = self.classifier(z_one_hot)
-
-        with pyro.plate("data", batch_size):
-            pyro.sample("obs", dist.Categorical(logits=logits), obs=y)
-        return logits
-
 def guide(x, y=None, num_latents=3):
     alpha_q = pyro.param("alpha_q", torch.ones(x.size(0), num_latents), constraint=dist.constraints.simplex)
     pyro.sample("z", dist.Categorical(alpha_q))
@@ -107,42 +147,98 @@ class GestureDataset(Dataset):
 
 def train_with_latent_variable(trainX, trainy, testX_list, testy, device, num_latents=3, epochs=30):
     set_seed()
-    dataset = GestureDataset(trainX, trainy)
-    train_loader = DataLoader(dataset, batch_size=48, shuffle=True)
 
-    pyro.clear_param_store()
-    model = LatentGestureModel(num_latents=num_latents, num_classes=len(np.unique(trainy))).to(device)
-    adam_optim = PyroOptim(torch_optim.Adam, {"lr": 1e-3})
-    svi = SVI(model, lambda x, y = None: guide(x, y, num_latents), adam_optim, loss = Trace_ELBO())
+    n_timesteps, n_features = trainX.shape[1], trainX.shape[2]
+    n_outputs = len(np.unique(trainy))
+
+    dataset = GestureDataset(trainX, trainy)
+    val_size = int(0.1 * len(dataset))
+    train_size = len(dataset) - val_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+    # set early stop
+    best_val_loss = float('inf')
+    patience = 5  # You can tweak this
+    patience_counter = 0
+
+    train_loader = DataLoader(train_dataset, batch_size=48, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=48)
+
+    model = LatentGestureModel(n_timesteps, n_features, num_latents, n_outputs).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    criterion = nn.CrossEntropyLoss()
+
+    for x_batch, y_batch in train_loader:
+        print("First batch X:", x_batch.shape)
+        print("First batch Y:", y_batch)
+        break
+
+    clip_acc = 0
 
     for epoch in range(epochs):
-        total_loss = 0
+        model.train()
+        train_loss, correct_train = 0, 0
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
-            loss = svi.step(x, y)
-            total_loss += loss
-        print(f"Epoch {epoch+1}/{epochs} Loss: {total_loss:.2f}")
+            optimizer.zero_grad()
+            out = model(x)
+            loss = criterion(out, y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+            correct_train += (out.argmax(dim=1) == y).sum().item()
 
-    # Predict
+        model.eval()
+        val_loss, correct_val = 0, 0
+        with torch.no_grad():
+            for x, y in val_loader:
+                x, y = x.to(device), y.to(device)
+                out = model(x)
+                loss = criterion(out, y)
+                val_loss += loss.item()
+                correct_val += (out.argmax(dim=1) == y).sum().item()
+
+        print(
+            f"Epoch {epoch + 1}/{epochs} | Train Acc: {correct_train}/{train_size} = {correct_train / train_size:.4f} | Val Acc:{correct_val}/{val_size} = {correct_val / val_size:.4f}")
+        if clip_acc < (correct_val / val_size):
+            clip_acc = correct_val / val_size
+
+        # Early stopping logic
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            best_model_state = model.state_dict()  # Save best model
+        else:
+            patience_counter += 1
+            print(f"⏳ No improvement in val_loss for {patience_counter} epoch(s)")
+
+        if patience_counter >= patience:
+            print("🛑 Early stopping triggered")
+            break
+
+    # Restore best model
+    model.load_state_dict(best_model_state)
+
+    # --- Predict test ---
     label_list = []
     model.eval()
     with torch.no_grad():
         for testX in testX_list:
             testX = torch.tensor(testX, dtype=torch.float32).permute(0, 2, 1).to(device)
-            logits_sum = torch.zeros(testX.shape[0], model.num_classes).to(device)
-            for z in range(num_latents):
-                z_one_hot = F.one_hot(torch.full((testX.shape[0],), z, dtype=torch.long), num_classes=num_latents).float().to(device)
-                logits = model.classifier(z_one_hot)
-                logits_sum += logits
-            pred = logits_sum.argmax(dim=1).cpu().numpy().tolist()
+            out = model(testX)
+            pred = out.argmax(dim=1).cpu().numpy().tolist()
+            # print("Predicted clips:", pred)
             if pred:
                 majority = Counter(pred).most_common(1)[0][0]
                 label_list.append(majority)
 
     predicted_labels = np.array(label_list)
+    print("Predicted Labels:", predicted_labels)
+    print("True Labels:", testy.squeeze())
     accuracy = np.mean(predicted_labels == testy.squeeze())
+    conf_matrix = confusion_matrix(testy.squeeze(), predicted_labels)
     print(f"✅ Final Test Accuracy: {accuracy:.4f}")
-    return accuracy
+    return accuracy, conf_matrix, clip_acc
 
 # --- Trainer ---
 def train_and_evaluate_model(trainX, trainy, testX_list, testy, device, epochs=60, batch_size=48):
@@ -164,7 +260,7 @@ def train_and_evaluate_model(trainX, trainy, testX_list, testy, device, epochs=6
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
 
-    model = GestureCNN(n_timesteps, n_features, n_outputs).to(device)
+    model = Gesturebasic(n_timesteps, n_features, n_outputs).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     criterion = nn.CrossEntropyLoss()
 
